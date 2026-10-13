@@ -46,6 +46,8 @@ import com.limelight.nvstream.jni.MoonBridge;
 public class NvConnection {
     // Carries the UDP streams when the host is reached over USB
     private volatile UsbRelay usbRelay;
+    private static final int USB_RELAY_STOP_GRACE_MS = 2000;
+    private volatile boolean stopping;
 
     // Context parameters
     private LimelightCryptoProvider cryptoProvider;
@@ -93,6 +95,24 @@ public class NvConnection {
     }
 
     public void stop() {
+        // The stop below says goodbye over the control stream, which over USB
+        // runs through the relay, so the relay stays up for it. But if that
+        // hangs on a stalled tunnel, the relay must not stay behind with
+        // undrained tunnel sockets: those wedged adbd until a replug.
+        stopping = true;
+        final UsbRelay pendingRelay = usbRelay;
+        if (pendingRelay != null) {
+            Thread deadline = new Thread(() -> {
+                try {
+                    Thread.sleep(USB_RELAY_STOP_GRACE_MS);
+                } catch (InterruptedException ignored) {
+                }
+                pendingRelay.stop();
+            }, "USB relay stop deadline");
+            deadline.setDaemon(true);
+            deadline.start();
+        }
+
         // Interrupt any pending connection. This is thread-safe.
         MoonBridge.interruptConnection();
 
@@ -415,6 +435,12 @@ public class NvConnection {
                         UsbRelay relay = UsbRelay.forBasePort(context.serverAddress.port);
                         relay.start();
                         usbRelay = relay;
+                        // A stop that came in while the relay started has
+                        // nothing to stop yet
+                        if (stopping) {
+                            relay.stop();
+                            return;
+                        }
                     } catch (IOException e) {
                         LimeLog.warning("USB relay: " + e.getMessage());
                         context.connListener.stageFailed(appName, 0, 0);
