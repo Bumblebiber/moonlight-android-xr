@@ -112,6 +112,7 @@ public class UsbRelay {
         void bind() throws IOException {
             udp = new DatagramSocket(new InetSocketAddress(InetAddress.getByName("127.0.0.1"), port));
             udp.setReceiveBufferSize(1 << 20);
+            udp.setSendBufferSize(1 << 20);
         }
 
         void startThreads() {
@@ -119,6 +120,11 @@ public class UsbRelay {
             Thread down = new Thread(this::fromPc, "USB relay down " + id);
             up.setDaemon(true);
             down.setDaemon(true);
+            // The VR runtime keeps the headset's cores busy; at default
+            // priority the receive side fell behind by hundreds of ms under
+            // load. Android maps this to an urgent-display nice level.
+            up.setPriority(Thread.MAX_PRIORITY);
+            down.setPriority(Thread.MAX_PRIORITY);
             up.start();
             down.start();
         }
@@ -159,6 +165,9 @@ public class UsbRelay {
                 try {
                     Socket s = new Socket();
                     s.setTcpNoDelay(true);
+                    // Room for a few video frames, so a short scheduling gap
+                    // here does not push back through adb to the PC
+                    s.setReceiveBufferSize(4 << 20);
                     s.connect(new InetSocketAddress("127.0.0.1", tunnelPort), 1000);
                     tunnel = s;
                     s.getOutputStream().write(UsbTunnel.hello(id, session));
@@ -170,6 +179,7 @@ public class UsbRelay {
                     tunnelOut = s.getOutputStream();
                     LimeLog.info("USB relay: channel " + id + (wasUp ? " reconnected" : " connected"));
                     wasUp = true;
+                    DatagramPacket pkt = new DatagramPacket(buf, 0);
                     long frames = 0, bytes = 0, maxGap = 0, sendErrors = 0;
                     long last = System.nanoTime(), statsStart = last;
                     for (;;) {
@@ -183,7 +193,9 @@ public class UsbRelay {
                         if (to != null) {
                             // A failed send loses this datagram, not the tunnel
                             try {
-                                udp.send(new DatagramPacket(buf, n, to));
+                                pkt.setData(buf, 0, n);
+                                pkt.setSocketAddress(to);
+                                udp.send(pkt);
                             } catch (IOException e) {
                                 sendErrors++;
                             }
