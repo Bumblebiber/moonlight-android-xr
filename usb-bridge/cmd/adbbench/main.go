@@ -5,8 +5,14 @@
 // round trip of those echoes per rate step.
 //
 // PC:      adbbench -mode server            (listens on 127.0.0.1:47900)
-//          adb reverse tcp:47900 tcp:47900
+//
+//	adb reverse tcp:47900 tcp:47900
+//
 // Headset: adb shell /data/local/tmp/adbbench -mode client
+//
+// With -echo 127.0.0.1:47901 on both sides (and a second adb reverse for
+// that port) the echoes come back over their own connection, to tell
+// head-of-line blocking in the shared connection apart from other delays.
 //
 // SPDX-License-Identifier: GPL-3.0-or-later
 package main
@@ -38,23 +44,24 @@ func main() {
 	addr := flag.String("addr", "127.0.0.1:47900", "listen/connect address")
 	rates := flag.String("rates", "0,50,100,150,300,600", "Mbit/s steps, 0 = idle pings only")
 	secs := flag.Int("secs", 10, "seconds per step")
+	echo := flag.String("echo", "", "optional separate address for echoes")
 	flag.Parse()
 	switch *mode {
 	case "server":
-		server(*addr, *rates, time.Duration(*secs)*time.Second)
+		server(*addr, *echo, *rates, time.Duration(*secs)*time.Second)
 	case "client":
-		client(*addr)
+		client(*addr, *echo)
 	default:
 		flag.Usage()
 	}
 }
 
-func client(addr string) {
-	c, err := net.Dial("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
+func client(addr, echoAddr string) {
+	c := dial(addr)
+	e := c
+	if echoAddr != "" {
+		e = dial(echoAddr)
 	}
-	c.(*net.TCPConn).SetNoDelay(true)
 	buf := make([]byte, pktSize)
 	var n int64
 	start := time.Now()
@@ -65,32 +72,34 @@ func client(addr string) {
 		}
 		n += pktSize
 		if buf[0] == typeEcho {
-			if _, err := c.Write(buf[:hdrSize]); err != nil {
+			if _, err := e.Write(buf[:hdrSize]); err != nil {
 				log.Fatal(err)
 			}
 		}
 	}
 }
 
-func server(addr, rateList string, step time.Duration) {
-	ln, err := net.Listen("tcp", addr)
-	if err != nil {
-		log.Fatal(err)
+func server(addr, echoAddr, rateList string, step time.Duration) {
+	// Both listeners up front: adb reverse accepts on the headset even when
+	// nothing listens here yet, and then just drops the connection
+	ln := listen(addr)
+	var lnEcho net.Listener
+	if echoAddr != "" {
+		lnEcho = listen(echoAddr)
 	}
-	fmt.Println("waiting for headset on", addr)
-	c, err := ln.Accept()
-	if err != nil {
-		log.Fatal(err)
+	fmt.Println("waiting for headset")
+	c := accept(ln)
+	e := c
+	if lnEcho != nil {
+		e = accept(lnEcho)
 	}
-	c.(*net.TCPConn).SetNoDelay(true)
-	fmt.Println("connected from", c.RemoteAddr())
 
 	var mu sync.Mutex
 	var rtts []time.Duration
 	go func() {
 		h := make([]byte, hdrSize)
 		for {
-			if _, err := io.ReadFull(c, h); err != nil {
+			if _, err := io.ReadFull(e, h); err != nil {
 				return
 			}
 			sent := int64(binary.BigEndian.Uint64(h[5:]))
@@ -141,6 +150,34 @@ func server(addr, rateList string, step time.Duration) {
 			pct(r, 50), pct(r, 95), pct(r, 99), pct(r, 100), len(r))
 	}
 	c.Close()
+}
+
+func dial(addr string) net.Conn {
+	c, err := net.Dial("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	c.(*net.TCPConn).SetNoDelay(true)
+	return c
+}
+
+func listen(addr string) net.Listener {
+	ln, err := net.Listen("tcp", addr)
+	if err != nil {
+		log.Fatal(err)
+	}
+	return ln
+}
+
+func accept(ln net.Listener) net.Conn {
+	c, err := ln.Accept()
+	if err != nil {
+		log.Fatal(err)
+	}
+	ln.Close()
+	c.(*net.TCPConn).SetNoDelay(true)
+	fmt.Println("connected from", c.RemoteAddr(), "on", c.LocalAddr())
+	return c
 }
 
 func pct(d []time.Duration, p int) string {
