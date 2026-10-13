@@ -55,7 +55,37 @@ type stream struct {
 	conn net.Conn
 	gone time.Time // when conn went away, zero while attached
 
+	// Totals for the life of the stream, logged when it closes
 	dropped atomic.Uint64
+	// Counters for the current stats interval, logged and reset every
+	// statsEvery while the stream moves
+	rxHost, txHost        atomic.Uint64
+	dropFull, dropUnplug  atomic.Uint64
+	queuePeak, writeMaxNs atomic.Int64
+}
+
+// statsEvery is how often a moving stream logs where its datagrams went,
+// which is what tells a stall in the helper from one past it.
+const statsEvery = 5 * time.Second
+
+func (st *stream) logStats() {
+	in, out := st.rxHost.Swap(0), st.txHost.Swap(0)
+	full, unplug := st.dropFull.Swap(0), st.dropUnplug.Swap(0)
+	peak, wmax := st.queuePeak.Swap(0), st.writeMaxNs.Swap(0)
+	if in == 0 && out == 0 {
+		return
+	}
+	log.Printf("session %016x channel %d: %ds from host %d, to host %d, dropped %d queue full / %d no tunnel, queue peak %d/%d, longest tunnel write %.1f ms",
+		st.key.session, st.key.channel, int(statsEvery/time.Second), in, out, full, unplug, peak, cap(st.out), float64(wmax)/1e6)
+}
+
+func maxInt64(a *atomic.Int64, v int64) {
+	for {
+		cur := a.Load()
+		if v <= cur || a.CompareAndSwap(cur, v) {
+			return
+		}
+	}
 }
 
 func (s *Server) Serve(ln net.Listener) error {
@@ -177,10 +207,12 @@ func (s *Server) pump(st *stream, c net.Conn) {
 					break more
 				}
 			}
+			start := time.Now()
 			if _, err := c.Write(b); err != nil {
 				c.Close()
 				return
 			}
+			maxInt64(&st.writeMaxNs, int64(time.Since(start)))
 		}
 	}()
 
@@ -194,6 +226,7 @@ func (s *Server) pump(st *stream, c net.Conn) {
 			break
 		}
 		st.udp.Write(p)
+		st.txHost.Add(1)
 	}
 	c.Close()
 	close(stop)
@@ -218,26 +251,36 @@ func (st *stream) fromHost() {
 			}
 			return
 		}
+		st.rxHost.Add(1)
 		st.mu.Lock()
 		attached := st.conn != nil
 		st.mu.Unlock()
 		if !attached {
 			st.dropped.Add(1)
+			st.dropUnplug.Add(1)
 			continue
 		}
 		select {
 		case st.out <- buf[:n]:
+			maxInt64(&st.queuePeak, int64(len(st.out)))
 		default:
 			st.dropped.Add(1)
+			st.dropFull.Add(1)
 		}
 	}
 }
 
-// reap closes streams whose tunnel has been gone longer than the grace.
+// reap closes streams whose tunnel has been gone longer than the grace,
+// and has the others log their stats.
 func (s *Server) reap() {
+	var ticks int
 	for range time.Tick(time.Second) {
+		ticks++
 		s.mu.Lock()
 		for k, st := range s.streams {
+			if ticks%int(statsEvery/time.Second) == 0 {
+				st.logStats()
+			}
 			st.mu.Lock()
 			expired := st.conn == nil && !st.gone.IsZero() && time.Since(st.gone) > sessionGrace
 			st.mu.Unlock()

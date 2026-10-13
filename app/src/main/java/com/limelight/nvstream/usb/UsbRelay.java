@@ -13,6 +13,8 @@ import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketAddress;
 import java.security.SecureRandom;
+import java.util.Locale;
+import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * The headset end of the USB tunnel. Moonlight streams from 127.0.0.1 in USB
@@ -29,6 +31,9 @@ import java.security.SecureRandom;
  */
 public class UsbRelay {
     private static final int RETRY_MS = 250;
+    // How often a moving channel logs its traffic, which is what places a
+    // stall before or after the headset
+    private static final long STATS_NS = 5_000_000_000L;
 
     private final int tunnelPort;
     private final Channel[] channels;
@@ -97,6 +102,7 @@ public class UsbRelay {
         volatile Socket tunnel;
         volatile OutputStream tunnelOut;
         volatile int status = UsbTunnel.STATUS_NO_HELPER;
+        final AtomicLong upCount = new AtomicLong();
 
         Channel(int id, int port) {
             this.id = id;
@@ -138,6 +144,7 @@ public class UsbRelay {
                 int n = UsbTunnel.putFrame(frame, 0, buf, 0, pkt.getLength());
                 try {
                     out.write(frame, 0, n);
+                    upCount.incrementAndGet();
                 } catch (IOException e) {
                     closeTunnel();
                 }
@@ -163,11 +170,32 @@ public class UsbRelay {
                     tunnelOut = s.getOutputStream();
                     LimeLog.info("USB relay: channel " + id + (wasUp ? " reconnected" : " connected"));
                     wasUp = true;
+                    long frames = 0, bytes = 0, maxGap = 0, sendErrors = 0;
+                    long last = System.nanoTime(), statsStart = last;
                     for (;;) {
                         int n = UsbTunnel.readFrame(in, buf);
+                        long now = System.nanoTime();
+                        maxGap = Math.max(maxGap, now - last);
+                        last = now;
+                        frames++;
+                        bytes += n;
                         SocketAddress to = client;
                         if (to != null) {
-                            udp.send(new DatagramPacket(buf, n, to));
+                            // A failed send loses this datagram, not the tunnel
+                            try {
+                                udp.send(new DatagramPacket(buf, n, to));
+                            } catch (IOException e) {
+                                sendErrors++;
+                            }
+                        }
+                        if (now - statsStart >= STATS_NS) {
+                            double secs = (now - statsStart) / 1e9;
+                            LimeLog.info(String.format(Locale.ROOT,
+                                    "USB relay: channel %d %.0fs: down %d (%.1f Mbit/s), longest gap %.1f ms, send errors %d, up %d",
+                                    id, secs, frames, bytes * 8 / secs / 1e6, maxGap / 1e6, sendErrors,
+                                    upCount.getAndSet(0)));
+                            frames = bytes = maxGap = sendErrors = 0;
+                            statsStart = now;
                         }
                     }
                 } catch (IOException e) {
