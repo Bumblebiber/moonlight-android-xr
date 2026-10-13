@@ -11,6 +11,9 @@ import android.net.NetworkInfo;
 import android.net.RouteInfo;
 import android.os.Build;
 
+import com.limelight.nvstream.usb.UsbRelay;
+import com.limelight.nvstream.usb.UsbTunnel;
+
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -41,6 +44,9 @@ import com.limelight.nvstream.input.MouseButtonPacket;
 import com.limelight.nvstream.jni.MoonBridge;
 
 public class NvConnection {
+    // Carries the UDP streams when the host is reached over USB
+    private volatile UsbRelay usbRelay;
+
     // Context parameters
     private LimelightCryptoProvider cryptoProvider;
     private String uniqueId;
@@ -97,6 +103,12 @@ public class NvConnection {
             MoonBridge.cleanupBridge();
         }
 
+        UsbRelay relay = usbRelay;
+        if (relay != null) {
+            relay.stop();
+            usbRelay = null;
+        }
+
         // Now a pending connection can be processed
         connectionAllowed.release();
     }
@@ -125,6 +137,12 @@ public class NvConnection {
     }
 
     private int detectServerConnectionType() {
+        // Over USB the host is this headset's loopback, which the checks below
+        // would take for remote: smaller packets, lower bitrate, no HQ audio
+        if (UsbTunnel.isUsbHost(context.serverAddress.address)) {
+            return StreamConfiguration.STREAM_CFG_LOCAL;
+        }
+
         ConnectivityManager connMgr = (ConnectivityManager) appContext.getSystemService(Context.CONNECTIVITY_SERVICE);
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
             Network activeNetwork = connMgr.getActiveNetwork();
@@ -389,6 +407,20 @@ public class NvConnection {
                 String appName = context.streamConfig.getApp().getAppName();
 
                 context.connListener.stageStarting(appName);
+
+                // Over USB the relay has to hold Sunshine's UDP ports before
+                // RTSP SETUP, after which Moonlight starts pinging them
+                if (UsbTunnel.isUsbHost(context.serverAddress.address)) {
+                    try {
+                        UsbRelay relay = UsbRelay.forBasePort(context.serverAddress.port);
+                        relay.start();
+                        usbRelay = relay;
+                    } catch (IOException e) {
+                        LimeLog.warning("USB relay: " + e.getMessage());
+                        context.connListener.stageFailed(appName, 0, 0);
+                        return;
+                    }
+                }
 
                 try {
                     if (!startApp()) {
