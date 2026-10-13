@@ -23,6 +23,7 @@ import com.limelight.nvstream.http.NvHTTP;
 import com.limelight.nvstream.http.PairingManager;
 import com.limelight.nvstream.mdns.MdnsComputer;
 import com.limelight.nvstream.mdns.MdnsDiscoveryListener;
+import com.limelight.nvstream.usb.UsbTunnel;
 import com.limelight.utils.CacheHelper;
 import com.limelight.utils.NetHelper;
 import com.limelight.utils.ServerHelper;
@@ -630,69 +631,43 @@ public class ComputerManagerService extends Service {
         ParallelPollTuple remoteInfo = new ParallelPollTuple(details.remoteAddress, details);
         ParallelPollTuple ipv6Info = new ParallelPollTuple(details.ipv6Address, details);
 
+        // In order of precedence: local, manual, remote IPv4, global IPv6. A
+        // manual address on the USB cable goes first, since a PC reachable
+        // both ways should stream over the cable.
+        ParallelPollTuple[] order;
+        if (details.manualAddress != null && UsbTunnel.isUsbHost(details.manualAddress.address)) {
+            order = new ParallelPollTuple[] {manualInfo, localInfo, remoteInfo, ipv6Info};
+        }
+        else {
+            order = new ParallelPollTuple[] {localInfo, manualInfo, remoteInfo, ipv6Info};
+        }
+
         // These must be started in order of precedence for the deduplication algorithm
         // to result in the correct behavior.
         HashSet<ComputerDetails.AddressTuple> uniqueAddresses = new HashSet<>();
-        startParallelPollThread(localInfo, uniqueAddresses);
-        startParallelPollThread(manualInfo, uniqueAddresses);
-        startParallelPollThread(remoteInfo, uniqueAddresses);
-        startParallelPollThread(ipv6Info, uniqueAddresses);
+        for (ParallelPollTuple tuple : order) {
+            startParallelPollThread(tuple, uniqueAddresses);
+        }
 
         try {
-            // Check local first
-            synchronized (localInfo) {
-                while (!localInfo.complete) {
-                    localInfo.wait();
-                }
+            for (ParallelPollTuple tuple : order) {
+                synchronized (tuple) {
+                    while (!tuple.complete) {
+                        tuple.wait();
+                    }
 
-                if (localInfo.returnedDetails != null) {
-                    localInfo.returnedDetails.activeAddress = localInfo.address;
-                    return localInfo.returnedDetails;
-                }
-            }
-
-            // Now manual
-            synchronized (manualInfo) {
-                while (!manualInfo.complete) {
-                    manualInfo.wait();
-                }
-
-                if (manualInfo.returnedDetails != null) {
-                    manualInfo.returnedDetails.activeAddress = manualInfo.address;
-                    return manualInfo.returnedDetails;
-                }
-            }
-
-            // Now remote IPv4
-            synchronized (remoteInfo) {
-                while (!remoteInfo.complete) {
-                    remoteInfo.wait();
-                }
-
-                if (remoteInfo.returnedDetails != null) {
-                    remoteInfo.returnedDetails.activeAddress = remoteInfo.address;
-                    return remoteInfo.returnedDetails;
-                }
-            }
-
-            // Now global IPv6
-            synchronized (ipv6Info) {
-                while (!ipv6Info.complete) {
-                    ipv6Info.wait();
-                }
-
-                if (ipv6Info.returnedDetails != null) {
-                    ipv6Info.returnedDetails.activeAddress = ipv6Info.address;
-                    return ipv6Info.returnedDetails;
+                    if (tuple.returnedDetails != null) {
+                        tuple.returnedDetails.activeAddress = tuple.address;
+                        return tuple.returnedDetails;
+                    }
                 }
             }
         } finally {
             // Stop any further polling if we've found a working address or we've been
             // interrupted by an attempt to stop polling.
-            localInfo.interrupt();
-            manualInfo.interrupt();
-            remoteInfo.interrupt();
-            ipv6Info.interrupt();
+            for (ParallelPollTuple tuple : order) {
+                tuple.interrupt();
+            }
         }
 
         return null;
